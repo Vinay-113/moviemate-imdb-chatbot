@@ -10,6 +10,10 @@
 - a local web interface built with the Python standard library
 - a notebook-style deliverable for submission
 
+## Live Demo
+
+[https://moviemate-imdb-chatbot.onrender.com](https://moviemate-imdb-chatbot.onrender.com)
+
 ## Run the app
 
 ```bash
