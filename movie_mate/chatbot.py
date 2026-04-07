@@ -348,7 +348,22 @@ class MovieChatbot:
     def _extract_title_from_query(self, query_key: str, require_trigger: bool = False) -> Movie | None:
         if require_trigger and not any(
             trigger in query_key
-            for trigger in ("about", "details", "similar to", "like ", "who directed", "cast of", "runtime of", "rating of")
+            for trigger in (
+                "about",
+                "details",
+                "similar to",
+                "like ",
+                "who directed",
+                "cast of",
+                "runtime of",
+                "rating of",
+                "overview of",
+                "plot of",
+                "tell me about",
+                "details on",
+                "details of",
+                "information on",
+            )
         ):
             return None
 
