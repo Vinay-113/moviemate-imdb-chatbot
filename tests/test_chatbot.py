@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from pathlib import Path
 
-from movie_mate import MovieChatbot, load_movies
+from movie_mate import MemoryStore, MovieChatbot, load_movies
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +49,20 @@ class MovieMateTests(unittest.TestCase):
         response = self.bot.respond("Who directed The Godfather?")
         self.assertIn("Francis Ford Coppola", response["reply"])
         self.assertEqual(response["cards"][0]["title"], "The Godfather")
+
+    def test_plot_lookup_returns_single_title_detail(self) -> None:
+        response = self.bot.respond("plot of Inception")
+        self.assertIn("Overview:", response["reply"])
+        self.assertEqual([card["title"] for card in response["cards"]], ["Inception"])
+
+    def test_memory_store_updates_and_affects_response_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            memory = MemoryStore(Path(directory) / "memory.json")
+            bot = MovieChatbot(MOVIES, memory_store=memory)
+            first = bot.respond("Suggest sci-fi movies", profile_id="user-1")
+            second = bot.respond("Recommend something for me", profile_id="user-1")
+            self.assertEqual(first["mode"], "fallback")
+            self.assertIn("Sci-Fi", second["memory_summary"])
 
 
 if __name__ == "__main__":

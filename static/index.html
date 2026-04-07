@@ -21,6 +21,7 @@
         <div class="hero-panel">
           <div class="hero-panel-title">Starter Prompts</div>
           <div class="chip-stack" id="starter-prompts"></div>
+          <p class="status-note" id="capability-note"></p>
           <button class="ghost-button" id="new-chat-button" type="button">Start Fresh</button>
         </div>
       </header>
@@ -73,6 +74,10 @@
           </div>
 
           <div class="messages" id="messages"></div>
+          <div class="status-row">
+            <span class="status-pill" id="runtime-mode">Mode: fallback</span>
+            <span class="status-pill" id="memory-summary">Memory: empty</span>
+          </div>
           <div class="filter-strip" id="active-filters"></div>
 
           <form class="composer" id="chat-form">

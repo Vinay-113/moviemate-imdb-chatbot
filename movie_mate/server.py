@@ -46,7 +46,8 @@ class MovieMateRequestHandler(BaseHTTPRequestHandler):
             payload = json.loads(raw_body or "{}")
             message = str(payload.get("message", "")).strip()
             session_id = payload.get("session_id")
-            response = self.chatbot.respond(message, session_id=session_id)
+            profile_id = payload.get("profile_id")
+            response = self.chatbot.respond(message, session_id=session_id, profile_id=profile_id)
             self._send_json(response)
         except json.JSONDecodeError:
             self._send_error(HTTPStatus.BAD_REQUEST, "Invalid JSON payload")

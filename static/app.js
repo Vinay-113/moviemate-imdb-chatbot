@@ -18,8 +18,23 @@ const filters = document.getElementById("active-filters");
 const starterPromptContainer = document.getElementById("starter-prompts");
 const newChatButton = document.getElementById("new-chat-button");
 const template = document.getElementById("message-template");
+const capabilityNote = document.getElementById("capability-note");
+const runtimeMode = document.getElementById("runtime-mode");
+const memorySummary = document.getElementById("memory-summary");
 
 const numberFormat = new Intl.NumberFormat("en-US");
+const profileId = getOrCreateProfileId();
+
+function getOrCreateProfileId() {
+  const storageKey = "moviemate-profile-id";
+  const existing = window.localStorage.getItem(storageKey);
+  if (existing) return existing;
+  const nextValue =
+    globalThis.crypto?.randomUUID?.() ??
+    `profile-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  window.localStorage.setItem(storageKey, nextValue);
+  return nextValue;
+}
 
 function addStarterPrompts() {
   starterPrompts.forEach((prompt) => {
@@ -130,6 +145,26 @@ function renderBars(containerId, data) {
   });
 }
 
+function renderCapabilities(capabilities) {
+  if (!capabilities) return;
+  if (capabilities.openai_enabled) {
+    const ragState = capabilities.embedding_cache_ready ? "RAG cache ready" : "RAG cache not built yet";
+    capabilityNote.textContent = `OpenAI mode is configured with ${capabilities.openai_model}. ${ragState}.`;
+    runtimeMode.textContent = capabilities.embedding_cache_ready
+      ? "Mode: openai-rag-memory"
+      : "Mode: openai-memory";
+  } else {
+    capabilityNote.textContent =
+      "Fallback mode is active. Set OPENAI_API_KEY to enable LLM responses and build the OpenAI embeddings cache for semantic RAG.";
+    runtimeMode.textContent = "Mode: fallback";
+  }
+}
+
+function renderRuntimeStatus(mode, memoryText) {
+  runtimeMode.textContent = `Mode: ${mode || "fallback"}`;
+  memorySummary.textContent = memoryText ? `Memory: ${memoryText}` : "Memory: empty";
+}
+
 function renderFilters(filterState) {
   filters.innerHTML = "";
   const pills = [];
@@ -164,6 +199,7 @@ async function loadInsights() {
   renderBars("top-directors", payload.top_directors);
   renderBars("top-stars", payload.top_stars);
   renderBars("missing-fields", payload.missing_fields);
+  renderCapabilities(payload.capabilities);
 }
 
 async function sendMessage(message) {
@@ -175,6 +211,7 @@ async function sendMessage(message) {
     body: JSON.stringify({
       message,
       session_id: sessionId,
+      profile_id: profileId,
     }),
   });
 
@@ -186,6 +223,7 @@ async function sendMessage(message) {
 
   sessionId = payload.session_id;
   renderFilters(payload.filters);
+  renderRuntimeStatus(payload.mode, payload.memory_summary);
   addMessage("assistant", payload.reply, payload.cards || []);
 }
 
@@ -197,6 +235,7 @@ function resetConversation() {
     "assistant",
     "Ask for genres, actors, directors, release years, runtimes, ratings, or movies similar to a title already in the dataset."
   );
+  memorySummary.textContent = "Memory: active for this browser";
 }
 
 form.addEventListener("submit", async (event) => {

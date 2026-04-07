@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import re
 import threading
@@ -8,6 +9,9 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 from .dataset import Movie, normalize_key, tokenize
+from .memory import MemoryStore, UserProfile
+from .openai_client import OpenAIAPIError, OpenAIClient
+from .rag import EmbeddingIndex
 
 
 FOLLOW_UP_MARKERS = (
@@ -30,6 +34,14 @@ RESET_MARKERS = (
     "search",
     "i want",
     "give me",
+)
+
+PERSONALIZATION_MARKERS = (
+    "for me",
+    "my taste",
+    "based on my history",
+    "based on what i like",
+    "something i would like",
 )
 
 DETAIL_PATTERNS = {
@@ -63,6 +75,7 @@ class SearchPlan:
     wants_count: bool = False
     specific_detail: str | None = None
     filter_only: bool = False
+    wants_personalized: bool = False
 
     def clone(self) -> "SearchPlan":
         return SearchPlan(
@@ -85,6 +98,7 @@ class SearchPlan:
             wants_count=self.wants_count,
             specific_detail=self.specific_detail,
             filter_only=self.filter_only,
+            wants_personalized=self.wants_personalized,
         )
 
 
@@ -95,8 +109,19 @@ class SessionState:
 
 
 class MovieChatbot:
-    def __init__(self, movies: list[Movie]) -> None:
+    def __init__(
+        self,
+        movies: list[Movie],
+        openai_client: OpenAIClient | None = None,
+        embedding_index: EmbeddingIndex | None = None,
+        memory_store: MemoryStore | None = None,
+        auto_build_embeddings: bool = False,
+    ) -> None:
         self.movies = movies
+        self.openai_client = openai_client
+        self.embedding_index = embedding_index
+        self.memory_store = memory_store
+        self.auto_build_embeddings = auto_build_embeddings
         self.movie_by_id = {movie.movie_id: movie for movie in movies}
         self.title_index = self._build_title_index(movies)
         self.sorted_title_keys = sorted(self.title_index, key=len, reverse=True)
@@ -110,7 +135,12 @@ class MovieChatbot:
     def new_session_id(self) -> str:
         return uuid.uuid4().hex
 
-    def respond(self, message: str, session_id: str | None = None) -> dict[str, object]:
+    def respond(
+        self,
+        message: str,
+        session_id: str | None = None,
+        profile_id: str | None = None,
+    ) -> dict[str, object]:
         clean_message = " ".join(message.split())
         if not clean_message:
             clean_message = "Show me highly rated movies."
@@ -118,6 +148,7 @@ class MovieChatbot:
         with self.lock:
             active_session_id = session_id or self.new_session_id()
             session = self.sessions.setdefault(active_session_id, SessionState())
+            profile = self.memory_store.get_profile(profile_id) if self.memory_store else None
 
             parsed_plan = self._parse_query(clean_message)
             used_context = False
@@ -128,13 +159,23 @@ class MovieChatbot:
             if parsed_plan.wants_details and parsed_plan.title_reference:
                 movie = self._find_title(parsed_plan.title_reference)
                 results = [movie] if movie else []
-                reply = self._build_detail_reply(movie, parsed_plan)
+                reply = self._build_response(clean_message, results, parsed_plan, used_context, profile)
             else:
-                results = self._search(parsed_plan)
-                reply = self._build_search_reply(results, parsed_plan, used_context)
+                results = self._search(parsed_plan, profile)
+                reply = self._build_response(clean_message, results, parsed_plan, used_context, profile)
 
             session.last_plan = parsed_plan
             session.last_results = [movie.movie_id for movie in results]
+            if self.memory_store:
+                self.memory_store.update_profile(
+                    profile_id=profile_id,
+                    message=clean_message,
+                    genres=sorted(parsed_plan.genres),
+                    people=sorted(parsed_plan.people),
+                    directors=sorted(parsed_plan.directors),
+                    titles=[movie.title for movie in results[:3]],
+                )
+                profile = self.memory_store.get_profile(profile_id)
 
         return {
             "session_id": active_session_id,
@@ -142,6 +183,8 @@ class MovieChatbot:
             "cards": [self._movie_card(movie) for movie in results[: parsed_plan.count]],
             "used_context": used_context,
             "filters": self._summarize_filters(parsed_plan),
+            "mode": self._active_mode(),
+            "memory_summary": self.memory_store.summarize(profile) if self.memory_store else "Memory disabled.",
         }
 
     def _build_title_index(self, movies: list[Movie]) -> dict[str, list[Movie]]:
@@ -220,6 +263,7 @@ class MovieChatbot:
         semantic_tokens = tokenize(query)
         plan.count = self._extract_count(query_key)
         plan.wants_count = "how many" in query_key or "count " in query_key
+        plan.wants_personalized = any(marker in query_key for marker in PERSONALIZATION_MARKERS)
 
         for detail_key, markers in DETAIL_PATTERNS.items():
             if any(marker in query_key for marker in markers):
@@ -428,7 +472,7 @@ class MovieChatbot:
             merged.semantic_query = current.semantic_query
         return merged
 
-    def _search(self, plan: SearchPlan) -> list[Movie]:
+    def _search(self, plan: SearchPlan, profile: UserProfile | None = None) -> list[Movie]:
         candidates = [movie for movie in self.movies if self._matches_filters(movie, plan)]
         if not candidates:
             return []
@@ -440,6 +484,27 @@ class MovieChatbot:
             seed = self._find_title(plan.similar_to)
             if seed is None:
                 return []
+
+            candidate_ids = [movie.movie_id for movie in candidates]
+            embedding_scores = self._embedding_similarity_scores(seed.movie_id, candidate_ids)
+            if embedding_scores is not None:
+                scored = []
+                for movie in candidates:
+                    if movie.movie_id == seed.movie_id:
+                        continue
+                    similarity = embedding_scores.get(movie.movie_id, 0.0)
+                    if plan.genres and any(genre in movie.genres for genre in plan.genres):
+                        similarity += 0.08
+                    if seed.director == movie.director:
+                        similarity += 0.07
+                    shared_stars = len(set(seed.stars) & set(movie.stars))
+                    similarity += shared_stars * 0.03
+                    similarity += self._personalization_bonus(profile, movie, plan)
+                    similarity += movie.rating / 100
+                    scored.append((similarity, movie))
+                scored.sort(key=lambda item: item[0], reverse=True)
+                return [movie for _, movie in scored[: plan.count]]
+
             scored = []
             seed_vector = self.document_vectors[seed.movie_id]
             seed_norm = self.document_norms[seed.movie_id]
@@ -453,21 +518,34 @@ class MovieChatbot:
                     similarity += 0.07
                 shared_stars = len(set(seed.stars) & set(movie.stars))
                 similarity += shared_stars * 0.03
+                similarity += self._personalization_bonus(profile, movie, plan)
                 similarity += movie.rating / 100
                 scored.append((similarity, movie))
             scored.sort(key=lambda item: item[0], reverse=True)
             return [movie for _, movie in scored[: plan.count]]
 
         query_vector, query_norm = self._build_query_vector(self._query_text_for_plan(plan))
+        candidate_ids = [movie.movie_id for movie in candidates]
+        embedding_scores = self._embedding_query_scores(self._query_text_for_plan(plan), candidate_ids)
         scored = []
         for movie in candidates:
-            relevance = self._cosine(query_vector, query_norm, self.document_vectors[movie.movie_id], self.document_norms[movie.movie_id])
+            lexical_relevance = self._cosine(
+                query_vector,
+                query_norm,
+                self.document_vectors[movie.movie_id],
+                self.document_norms[movie.movie_id],
+            )
+            if embedding_scores is not None:
+                relevance = lexical_relevance * 0.35 + embedding_scores.get(movie.movie_id, 0.0) * 0.65
+            else:
+                relevance = lexical_relevance
             if plan.genres:
                 relevance += 0.06 * sum(1 for genre in plan.genres if genre in movie.genres)
             if plan.people:
                 relevance += 0.07 * sum(1 for person in plan.people if person in movie.stars or person == movie.director)
             if plan.directors and movie.director in plan.directors:
                 relevance += 0.08
+            relevance += self._personalization_bonus(profile, movie, plan)
             relevance += movie.rating / 200
             relevance += min(movie.votes / 2_000_000, 0.08)
             scored.append((relevance, movie))
@@ -478,6 +556,28 @@ class MovieChatbot:
 
         sorted_movies = self._sort_movies([movie for _, movie in scored], plan.sort_by)
         return sorted_movies[: plan.count]
+
+    def _embedding_query_scores(self, query_text: str, candidate_ids: list[int]) -> dict[int, float] | None:
+        if self.embedding_index is None:
+            return None
+        ready = self.embedding_index.ensure_ready(build_if_missing=self.auto_build_embeddings)
+        if not ready:
+            return None
+        scores = self.embedding_index.search(query_text, candidate_ids, len(candidate_ids))
+        if scores is None:
+            return None
+        return {movie_id: score for movie_id, score in scores}
+
+    def _embedding_similarity_scores(self, seed_movie_id: int, candidate_ids: list[int]) -> dict[int, float] | None:
+        if self.embedding_index is None:
+            return None
+        ready = self.embedding_index.ensure_ready(build_if_missing=self.auto_build_embeddings)
+        if not ready:
+            return None
+        scores = self.embedding_index.similar(seed_movie_id, candidate_ids, len(candidate_ids))
+        if scores is None:
+            return None
+        return {movie_id: score for movie_id, score in scores}
 
     def _query_text_for_plan(self, plan: SearchPlan) -> str:
         pieces = [plan.semantic_query]
@@ -553,11 +653,97 @@ class MovieChatbot:
             return False
         return True
 
+    def _personalization_bonus(
+        self,
+        profile: UserProfile | None,
+        movie: Movie,
+        plan: SearchPlan,
+    ) -> float:
+        if self.memory_store is None or profile is None:
+            return 0.0
+        if plan.genres or plan.people or plan.directors:
+            return self.memory_store.personalization_bonus(profile, movie.genres, movie.director, movie.stars) * 0.35
+        if plan.wants_personalized or "recommend" in normalize_key(plan.raw_query):
+            return self.memory_store.personalization_bonus(profile, movie.genres, movie.director, movie.stars)
+        return self.memory_store.personalization_bonus(profile, movie.genres, movie.director, movie.stars) * 0.2
+
     def _find_title(self, title: str) -> Movie | None:
         key = normalize_key(title)
         if key in self.title_index:
             return sorted(self.title_index[key], key=lambda movie: movie.votes, reverse=True)[0]
         return None
+
+    def _build_response(
+        self,
+        user_message: str,
+        results: list[Movie | None],
+        plan: SearchPlan,
+        used_context: bool,
+        profile: UserProfile | None,
+    ) -> str:
+        llm_reply = self._build_llm_reply(user_message, results, plan, used_context, profile)
+        if llm_reply:
+            return llm_reply
+
+        if plan.wants_details and plan.title_reference:
+            movie = results[0] if results else None
+            return self._build_detail_reply(movie, plan)
+        concrete_results = [movie for movie in results if movie is not None]
+        return self._build_search_reply(concrete_results, plan, used_context)
+
+    def _build_llm_reply(
+        self,
+        user_message: str,
+        results: list[Movie | None],
+        plan: SearchPlan,
+        used_context: bool,
+        profile: UserProfile | None,
+    ) -> str | None:
+        if self.openai_client is None:
+            return None
+
+        concrete_results = [movie for movie in results if movie is not None]
+        result_payload = [self._movie_card(movie) for movie in concrete_results[:6]]
+        count_value = len([movie for movie in self.movies if self._matches_filters(movie, plan)]) if plan.wants_count else None
+        prompt_payload = {
+            "user_message": user_message,
+            "used_context": used_context,
+            "query_plan": {
+                "genres": sorted(plan.genres),
+                "people": sorted(plan.people),
+                "directors": sorted(plan.directors),
+                "year_min": plan.year_min,
+                "year_max": plan.year_max,
+                "runtime_min": plan.runtime_min,
+                "runtime_max": plan.runtime_max,
+                "rating_min": plan.rating_min,
+                "rating_max": plan.rating_max,
+                "sort_by": plan.sort_by,
+                "similar_to": plan.similar_to,
+                "title_reference": plan.title_reference,
+                "wants_details": plan.wants_details,
+                "wants_count": plan.wants_count,
+                "specific_detail": plan.specific_detail,
+            },
+            "user_profile_summary": self.memory_store.summarize(profile) if self.memory_store else "No saved user history yet.",
+            "result_count": count_value if count_value is not None else len(concrete_results),
+            "results": result_payload,
+        }
+        instructions = (
+            "You are MovieMate, a conversational movie assistant. Use only the supplied dataset facts and "
+            "profile summary. Do not invent missing metadata or additional titles. If the user asks for a plot, "
+            "overview, cast, rating, runtime, year, or director of a single matched title, answer directly. "
+            "If the user asks for recommendations, recommend from the supplied results only and mention concise reasons "
+            "grounded in genre, cast, director, rating, runtime, or overview. If no results are supplied, clearly say "
+            "that the dataset did not produce a match. Keep the answer concise and natural."
+        )
+        try:
+            return self.openai_client.generate_text(
+                instructions=instructions,
+                prompt=json.dumps(prompt_payload, ensure_ascii=False),
+            )
+        except OpenAIAPIError:
+            return None
 
     def _build_detail_reply(self, movie: Movie | None, plan: SearchPlan) -> str:
         if movie is None:
@@ -602,6 +788,15 @@ class MovieChatbot:
         titles = ", ".join(f"{movie.title} ({movie.year or 'Unknown'})" for movie in results[:3])
         description = self._describe_filters(plan)
         return f"{lead}{description} Top picks include {titles}."
+
+    def _active_mode(self) -> str:
+        if self.openai_client and self.embedding_index and self.embedding_index.ready:
+            return "openai-rag-memory"
+        if self.openai_client:
+            return "openai-memory"
+        if self.embedding_index and self.embedding_index.ready:
+            return "embedding-memory"
+        return "fallback"
 
     def _describe_filters(self, plan: SearchPlan) -> str:
         parts: list[str] = []
